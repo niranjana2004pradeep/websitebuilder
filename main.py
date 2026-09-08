@@ -1,253 +1,202 @@
-
 import os
-import re
 import uuid
 import zipfile
 import logging
- 
+import tempfile
+
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
- 
+
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
- 
+
 load_dotenv()
- 
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("website-gen-unstructured")
- 
+logger = logging.getLogger("website-gen-structured")
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL","openai/gpt-oss-120b")
- 
+GROQ_MODEL = os.getenv("GROQ_MODEL")
+
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY must be set in the environment (.env). Get a free key at console.groq.com")
- 
-# No response_format / json mode / schema of any kind — the model can
-# respond however it likes. This is the UNSTRUCTURED half of the comparison.
+
+# Structured output is enforced by the Pydantic models and the
+# with_structured_output() Runnable wrappers below.
 llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.3)
- 
-app = FastAPI(title="AI Website Generation Pipeline — Unstructured Output (LangChain)")
- 
-WORK_DIR = "/tmp/website_gen_unstructured"
+
+app = FastAPI(title="AI Website Generation Pipeline - Structured Output (LangChain)")
+
+WORK_DIR = os.path.join(tempfile.gettempdir(), "website_gen_structured")
 os.makedirs(WORK_DIR, exist_ok=True)
- 
+
 MAX_SECTIONS = 5
- 
- 
+
+# How much accumulated history to feed back into each new prompt. Even with
+# structured (more compact) output, this is capped defensively so a long
+# site can't silently regrow the same rate-limit problem hit earlier.
+MAX_CONTEXT_FRAGMENTS = 3
+MAX_CONTEXT_CHARS = 2000
+
+
 # ---------------------------------------------------------------------------
 # In-memory project state
 #
-# IMPORTANT DIFFERENCE from the structured version: without JSON output, we
-# CANNOT reliably extract "just the new CSS variables" or "just the new class
-# names" from a model's free-text response — there's no guaranteed field to
-# read. So instead of tracking clean structured deltas, this version falls
-# back to the naive approach: keep the full raw text of everything generated
-# so far, and paste it all back into the next prompt as context. This is
-# exactly the expensive, unreliable fallback we deliberately avoided in the
-# structured version — kept here on purpose so the contrast is visible.
+# css_variables is the structured "delta" store — the shared design-system
+# facts that must stay consistent — separate from the raw code fragments.
 # ---------------------------------------------------------------------------
- 
+
 PROJECTS: dict[str, "ProjectState"] = {}
- 
- 
+
+
 class ProjectState(BaseModel):
-    raw_fragments: list[str] = Field(default_factory=list)  # full raw model output, in order
+    html_fragments: list[str] = Field(default_factory=list)
+    css_fragments: list[str] = Field(default_factory=list)
+    js_fragments: list[str] = Field(default_factory=list)
+    css_variables: dict[str, str] = Field(default_factory=dict)
     section_order: list[str] = Field(default_factory=list)
- 
- 
+
+
+def build_capped_context(state: "ProjectState") -> str:
+    """Only the most recent fragments, hard-capped in length — prevents
+    unbounded prompt growth as more sections get generated."""
+    all_fragments = state.html_fragments + state.css_fragments + state.js_fragments
+    if not all_fragments:
+        return "(nothing generated yet)"
+    recent = all_fragments[-MAX_CONTEXT_FRAGMENTS:]
+    joined = "\n\n".join(recent)
+    return joined[-MAX_CONTEXT_CHARS:]
+
+
 # ---------------------------------------------------------------------------
-# Naive extraction helpers (regex-based — fragile by nature, on purpose)
+# Structured schemas
 # ---------------------------------------------------------------------------
- 
-def extract_code_block(text: str, language: str) -> str:
-    """Best-effort extraction of a ```language ... ``` fenced block.
-    Returns an empty string if the model didn't format its response this way
-    — which is common, because nothing FORCES it to. This function is the
-    manual, error-prone stand-in for what a schema + parser would guarantee."""
-    pattern = rf"```{language}\s*(.*?)```"
-    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-    return match.group(1).strip() if match else ""
- 
- 
-def parse_numbered_sections(text: str) -> list[dict]:
-    """Naive parsing of a numbered list like:
-         1. navbar: A responsive navbar with...
-         2. hero: A bold headline...
-    Returns [] if the model didn't follow this format closely enough to match
-    — again, nothing enforces that it will."""
-    pattern = r"^\s*\d+\.\s*([a-zA-Z_\-]+)\s*[:\-]\s*(.+)$"
-    matches = re.findall(pattern, text, re.MULTILINE)
-    return [{"section_type": m[0].strip().lower(), "content_brief": m[1].strip()} for m in matches]
- 
- 
+
+class SectionPlan(BaseModel):
+    section_type: str
+    content_brief: str
+
+
+class SitePlan(BaseModel):
+    sections: list[SectionPlan]
+
+
+class SectionOutput(BaseModel):
+    html: str = Field(description="HTML code for the section only. Give the outer element an id matching its own section_type.")
+    css: str = Field(description="CSS rules for this section only. Do NOT declare :root or any CSS custom properties here — report new ones via new_css_variables instead.")
+    js: str = Field(default="", description="JavaScript code, or an empty string if none is needed")
+    new_css_variables: dict[str, str] = Field(
+        default_factory=dict,
+        description="Any NEW CSS custom properties this section introduces, e.g. {'--accent': '#ffcc00'}. Leave empty if reusing existing ones from context.",
+    )
+
+
+class ElementOutput(BaseModel):
+    code: str = Field(description="Only the requested HTML, CSS, or JavaScript code — no explanation, no Markdown fences.")
+    new_css_variables: dict[str, str] = Field(
+        default_factory=dict,
+        description="Any NEW CSS custom properties this element introduces, if applicable. Leave empty otherwise.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # LangChain Runnable chains (LCEL: prompt | llm)
 # ---------------------------------------------------------------------------
- 
-PLANNING_SYSTEM_PROMPT = """You are a website architect. A non-technical user will describe a website \
-they want. Break their description into an ordered list of sections needed for a complete website.
- 
-Always list a "navbar" first and a "footer" last. Respond as a numbered plain-text list, ONE section \
-per line, in exactly this format (nothing else, no extra commentary):
- 
-1. section_type: content brief for that section
-2. section_type: content brief for that section
-...
+
+PLANNING_SYSTEM_PROMPT = """You are a website architect.
+
+Break the user's website description into an ordered list of sections.
+
+Rules:
+- The first section must be navbar.
+- The last section must be footer.
+- Choose the sections that match the user's description.
+- Give every section a useful content brief.
+- Return the result using the required structured fields.
 """
- 
+
 planning_prompt = ChatPromptTemplate.from_messages([
     ("system", PLANNING_SYSTEM_PROMPT),
     ("human", "{description}"),
 ])
-planning_chain = planning_prompt | llm  # Runnable composition (LCEL)
- 
- 
-SECTION_SYSTEM_PROMPT = """You are an expert front-end developer. Generate ONE section of a website: \
-its HTML, its CSS, and JS only if genuinely needed.
- 
-Context — everything generated so far in this project (for consistency; reuse existing colors, class \
-names, and function names where relevant instead of inventing new ones):
+structured_planner = llm.with_structured_output(SitePlan)
+planning_chain = planning_prompt | structured_planner
+
+
+SECTION_SYSTEM_PROMPT = """You are an expert front-end developer.
+
+Generate one complete website section.
+
+Full planned site structure (in order) — use these EXACT section_type values as
+element ids and as anchor targets for any internal links (e.g. a link to the
+"menu" section must use href="#menu", and the element for that section must
+have id="menu"):
+{full_site_plan}
+
+Design system already established (reuse these variables via var(--name);
+do not redeclare :root or invent duplicates — only report genuinely NEW
+variables via the new_css_variables field):
+{existing_css_variables}
+
+Context — recent code generated so far in this project (for tone/style consistency):
 {previous_context}
- 
-Present your answer using fenced code blocks labeled by language, like this:
- 
-```html
-<!-- the section's HTML -->
-```
- 
-```css
-/* the section's CSS */
-```
- 
-```js
-// JS for this section, omit this block entirely if none is needed
-```
- 
-You may briefly explain your choices before or after the code blocks if you want to.
+
+Return:
+- html: the section's HTML only, with id="{section_type}" on its outer element
+- css: the section's CSS only (no :root, no variable declarations)
+- js: JavaScript only when needed, otherwise an empty string
+- new_css_variables: only variables this section is introducing for the first time
+
+Do not include explanations or Markdown code fences.
 """
- 
+
 section_prompt = ChatPromptTemplate.from_messages([
     ("system", SECTION_SYSTEM_PROMPT),
     ("human", "Section to generate: {section_type}\n\nContent brief: {content_brief}"),
 ])
-section_chain = section_prompt | llm  # Runnable composition (LCEL)
- 
- 
+structured_section_llm = llm.with_structured_output(SectionOutput)
+section_chain = section_prompt | structured_section_llm
+
+
 ELEMENT_SYSTEM_PROMPT = """You are an expert front-end developer. Generate a single {element_type} \
 element for a website based on the instruction below.
- 
-Context — everything generated so far in this project (for consistency):
+
+Design system already established (reuse these variables via var(--name);
+only report genuinely NEW variables via new_css_variables):
+{existing_css_variables}
+
+Context — recent code generated so far in this project (for consistency):
 {previous_context}
- 
-Present your answer in a single fenced code block labeled with the language, e.g.:
-```{element_type}
-...code...
-```
-You may briefly explain your choices before or after the code block if you want to.
+
+Instruction: {instruction}
+
+Existing code to modify/extend (if any): {existing_code}
+
+Return only the requested {element_type} code — no explanation, no Markdown fences.
 """
- 
+
 element_prompt = ChatPromptTemplate.from_messages([
     ("system", ELEMENT_SYSTEM_PROMPT),
-    ("human", "Instruction: {instruction}\n\nExisting code to modify/extend (if any): {existing_code}"),
 ])
-element_chain = element_prompt | llm  # Runnable composition (LCEL)
- 
- 
+structured_element_llm = llm.with_structured_output(ElementOutput)
+element_chain = element_prompt | structured_element_llm
+
+
 # ---------------------------------------------------------------------------
-# MODE A — one description -> planned, generated site (unstructured)
+# Shared assembly helpers
 # ---------------------------------------------------------------------------
- 
-class SiteGenerationRequest(BaseModel):
-    description: str
- 
- 
-class SiteGenerationResponse(BaseModel):
-    project_id: str
-    sections_generated: list[str]
-    raw_model_outputs: list[str]  # exposed deliberately so you can SEE the messiness
-    html: str
-    css: str
-    js: str
- 
- 
-@app.post("/generate-site", response_model=SiteGenerationResponse)
-def generate_site(req: SiteGenerationRequest):
-    if not req.description.strip():
-        raise HTTPException(status_code=400, detail="Description must not be empty.")
- 
-    project_id = str(uuid.uuid4())
-    state = ProjectState()
-    PROJECTS[project_id] = state
- 
-    plan_result = planning_chain.invoke({"description": req.description})
-    plan_text = plan_result.content
-    sections = parse_numbered_sections(plan_text)
- 
-    if not sections:
-        # This is the unstructured failure mode made visible: the model's
-        # text didn't match our expected numbered-list pattern, so there is
-        # NOTHING reliable to extract. A schema would have prevented this.
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not parse a section plan from the model's response. Raw output was: {plan_text[:500]}",
-        )
- 
-    sections = sections[:MAX_SECTIONS]
- 
-    html_fragments, css_fragments, js_fragments = [], [], []
- 
-    for section in sections:
-        previous_context = "\n\n---\n\n".join(state.raw_fragments) if state.raw_fragments else "(nothing generated yet)"
- 
-        result = section_chain.invoke({
-            "section_type": section["section_type"],
-            "content_brief": section["content_brief"],
-            "previous_context": previous_context,
-        })
-        raw_text = result.content
-        state.raw_fragments.append(raw_text)
-        state.section_order.append(section["section_type"])
- 
-        html_part = extract_code_block(raw_text, "html")
-        css_part = extract_code_block(raw_text, "css")
-        js_part = extract_code_block(raw_text, "js")
- 
-        if html_part:
-            html_fragments.append(html_part)
-        else:
-            logger.warning(f"No HTML block found for section '{section['section_type']}' — model output didn't match expected format.")
-        if css_part:
-            css_fragments.append(css_part)
-        if js_part:
-            js_fragments.append(js_part)
- 
-    html_content = _assemble_html(html_fragments)
-    css_content = "\n\n".join(css_fragments)
-    js_content = "\n\n".join(js_fragments) if js_fragments else "// no JS generated"
- 
-    _write_files(project_id, html_content, css_content, js_content)
- 
-    return SiteGenerationResponse(
-        project_id=project_id,
-        sections_generated=state.section_order,
-        raw_model_outputs=state.raw_fragments,
-        html=html_content,
-        css=css_content,
-        js=js_content,
-    )
- 
- 
+
 def _assemble_html(html_fragments: list[str]) -> str:
     body = "\n\n".join(html_fragments)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Generated Website</title>
-  <link rel="stylesheet" href="styles.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Generated Website</title>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 {body}
@@ -255,8 +204,20 @@ def _assemble_html(html_fragments: list[str]) -> str:
 </body>
 </html>
 """
- 
- 
+
+
+def assemble_site(state: "ProjectState") -> tuple[str, str, str]:
+    html_content = _assemble_html(state.html_fragments)
+
+    root_vars = "\n".join(f"  {k}: {v};" for k, v in state.css_variables.items())
+    root_block = f":root {{\n{root_vars}\n}}\n\n" if state.css_variables else ""
+    css_content = root_block + "\n\n".join(state.css_fragments)
+
+    js_content = "\n\n".join(state.js_fragments) if state.js_fragments else "// no JS generated"
+
+    return html_content, css_content, js_content
+
+
 def _write_files(project_id: str, html: str, css: str, js: str) -> None:
     project_dir = os.path.join(WORK_DIR, project_id)
     os.makedirs(project_dir, exist_ok=True)
@@ -266,87 +227,187 @@ def _write_files(project_id: str, html: str, css: str, js: str) -> None:
         f.write(css)
     with open(os.path.join(project_dir, "script.js"), "w", encoding="utf-8") as f:
         f.write(js)
- 
- 
+
+
 # ---------------------------------------------------------------------------
-# MODE B — manual, one element at a time (unstructured)
+# MODE A — one description -> planned, generated site (structured)
 # ---------------------------------------------------------------------------
- 
+
+class SiteGenerationRequest(BaseModel):
+    description: str
+
+
+class SiteGenerationResponse(BaseModel):
+    project_id: str
+    sections_generated: list[str]
+    html: str
+    css: str
+    js: str
+
+
+@app.post("/generate-site", response_model=SiteGenerationResponse)
+def generate_site(req: SiteGenerationRequest):
+    if not req.description.strip():
+        raise HTTPException(status_code=400, detail="Description must not be empty.")
+
+    project_id = str(uuid.uuid4())
+    state = ProjectState()
+    PROJECTS[project_id] = state
+
+    try:
+        plan_result = planning_chain.invoke({"description": req.description})
+    except Exception as error:
+        logger.exception("Structured planning failed")
+        raise HTTPException(status_code=502, detail=f"Website planning failed: {error}")
+
+    sections = plan_result.sections[:MAX_SECTIONS]
+
+    if not sections:
+        raise HTTPException(status_code=502, detail="The model returned an empty section plan.")
+
+    # Built ONCE, from the full plan — this is what lets the navbar (generated
+    # first) already know the ids of sections that don't exist yet.
+    full_site_plan = "\n".join(f"- {s.section_type}: {s.content_brief}" for s in sections)
+
+    for section in sections:
+        previous_context = build_capped_context(state)
+
+        try:
+            result = section_chain.invoke({
+                "section_type": section.section_type,
+                "content_brief": section.content_brief,
+                "full_site_plan": full_site_plan,
+                "existing_css_variables": state.css_variables or "(none yet)",
+                "previous_context": previous_context,
+            })
+        except Exception as error:
+            logger.exception("Structured generation failed for section %s", section.section_type)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Generation failed for section '{section.section_type}': {error}",
+            )
+
+        if not result.html.strip():
+            raise HTTPException(
+                status_code=502,
+                detail=f"Model returned empty HTML for section '{section.section_type}'.",
+            )
+
+        state.html_fragments.append(result.html)
+        if result.css.strip():
+            state.css_fragments.append(result.css)
+        if result.js.strip():
+            state.js_fragments.append(result.js)
+        state.css_variables.update(result.new_css_variables or {})
+
+        state.section_order.append(section.section_type)
+
+    html_content, css_content, js_content = assemble_site(state)
+    _write_files(project_id, html_content, css_content, js_content)
+
+    return SiteGenerationResponse(
+        project_id=project_id,
+        sections_generated=state.section_order,
+        html=html_content,
+        css=css_content,
+        js=js_content,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MODE B — manual, one element at a time (structured)
+# ---------------------------------------------------------------------------
+
 class GenerateRequest(BaseModel):
     project_id: str
     element_type: str  # "html" | "css" | "js"
     instruction: str
     existing_code: str | None = None
- 
- 
+
+
 class GenerateResponse(BaseModel):
     project_id: str
     element_type: str
-    raw_model_output: str   # the full, unstructured response — shown as-is
-    extracted_code: str     # best-effort regex extraction from it
- 
- 
+    code: str
+
+
 @app.post("/session/start")
 def start_session():
     project_id = str(uuid.uuid4())
     PROJECTS[project_id] = ProjectState()
     return {"project_id": project_id}
- 
- 
+
+
 @app.get("/session/{project_id}/state")
 def get_state(project_id: str):
     state = PROJECTS.get(project_id)
     if not state:
         raise HTTPException(status_code=404, detail="Project not found.")
     return state
- 
- 
+
+
 @app.post("/generate-element", response_model=GenerateResponse)
 def generate_element(req: GenerateRequest):
     state = PROJECTS.get(req.project_id)
     if not state:
         raise HTTPException(status_code=404, detail="Project not found. Call /session/start first.")
- 
+
     if req.element_type not in ("html", "css", "js"):
         raise HTTPException(status_code=400, detail="element_type must be 'html', 'css', or 'js'.")
- 
+
     if not req.instruction.strip():
         raise HTTPException(status_code=400, detail="Instruction must not be empty.")
- 
-    previous_context = "\n\n---\n\n".join(state.raw_fragments) if state.raw_fragments else "(nothing generated yet)"
- 
-    result = element_chain.invoke({
-        "element_type": req.element_type,
-        "instruction": req.instruction,
-        "existing_code": req.existing_code or "(none provided)",
-        "previous_context": previous_context,
-    })
-    raw_text = result.content
-    extracted = extract_code_block(raw_text, req.element_type)
- 
-    state.raw_fragments.append(raw_text)
- 
+
+    previous_context = build_capped_context(state)
+
+    try:
+        result = element_chain.invoke({
+            "element_type": req.element_type,
+            "instruction": req.instruction,
+            "existing_code": req.existing_code or "(none provided)",
+            "existing_css_variables": state.css_variables or "(none yet)",
+            "previous_context": previous_context,
+        })
+    except Exception as error:
+        logger.exception("Structured element generation failed")
+        raise HTTPException(status_code=502, detail=f"Generation failed: {error}")
+
+    if not result.code.strip():
+        raise HTTPException(status_code=502, detail="Model returned empty code.")
+
+    if req.element_type == "html":
+        state.html_fragments.append(result.code)
+    elif req.element_type == "css":
+        state.css_fragments.append(result.code)
+    else:
+        state.js_fragments.append(result.code)
+    state.css_variables.update(result.new_css_variables or {})
+
     return GenerateResponse(
         project_id=req.project_id,
         element_type=req.element_type,
-        raw_model_output=raw_text,
-        extracted_code=extracted,
+        code=result.code,
     )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Finalize (zip download)
 # ---------------------------------------------------------------------------
- 
+
 @app.post("/finalize/{project_id}")
 def finalize_site(project_id: str):
+    state = PROJECTS.get(project_id)
+    if state and state.html_fragments:
+        html_content, css_content, js_content = assemble_site(state)
+        _write_files(project_id, html_content, css_content, js_content)
+
     project_dir = os.path.join(WORK_DIR, project_id)
     if not os.path.exists(os.path.join(project_dir, "index.html")):
         raise HTTPException(status_code=400, detail="Nothing to finalize yet — call /generate-site first.")
- 
+
     zip_path = os.path.join(WORK_DIR, f"{project_id}.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for filename in ("index.html", "styles.css", "script.js"):
             zf.write(os.path.join(project_dir, filename), arcname=filename)
- 
+
     return FileResponse(zip_path, filename="generated_website.zip", media_type="application/zip")
