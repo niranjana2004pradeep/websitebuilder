@@ -1,0 +1,126 @@
+/* Basic reset */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+}
+
+body {
+  line-height: 1.6;
+  color: #333;
+  background-color: #fdfdfd;
+}
+
+header {
+  background: #6f4e37; /* coffee brown */
+  color: #fff;
+  padding: 1rem 2rem;
+  text-align: center;
+}
+
+header h1 {
+  font-size: 2.5rem;
+  margin-bottom: 0.5rem;
+}
+
+nav {
+  margin-top: 0.5rem;
+}
+
+nav a {
+  color: #fff;
+  margin: 0 1rem;
+  text-decoration: none;
+  font-weight: bold;
+}
+
+.hero {
+  background: url('https://images.unsplash.com/photo-1509042239860-f550ce710b93?auto=format&fit=crop&w=1350&q=80') center/cover no-repeat;
+  height: 60vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  text-shadow: 2px 2px 4px rgba(0,0,0,0.6);
+}
+
+.hero h2 {
+  font-size: 3rem;
+  background: rgba(0,0,0,0.4);
+  padding: 0.5rem 1rem;
+  border-radius: 5px;
+}
+
+section {
+  padding: 3rem 2rem;
+  max-width: 1200px;
+  margin: auto;
+}
+
+section h3 {
+  font-size: 2rem;
+  margin-bottom: 1rem;
+  text-align: center;
+  color: #6f4e37;
+}
+
+.menu-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1.5rem;
+}
+
+.menu-item {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+  text-align: center;
+}
+
+.menu-item img {
+  width: 100%;
+  height: 150px;
+  object-fit: cover;
+}
+
+.menu-item h4 {
+  margin: 0.5rem 0;
+  color: #6f4e37;
+}
+
+.menu-item p {
+  padding: 0 0.5rem 0.5rem;
+  font-size: 0.9rem;
+}
+
+footer {
+  background: #333;
+  color: #fff;
+  text-align: center;
+  padding: 1rem;
+  font-size: 0.9rem;
+}
+
+/* Simple button style */
+.btn {
+  display: inline-block;
+  background: #6f4e37;
+  color: #fff;
+  padding: 0.75rem 1.5rem;
+  border-radius: 4px;
+  text-decoration: none;
+  margin-top: 1rem;
+  transition: background 0.3s;
+}
+
+.btn:hover {
+  background: #5a3e2b;
+}
+
+/* Smooth scroll */
+html {
+  scroll-behavior: smooth;
+}
